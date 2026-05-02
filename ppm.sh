@@ -22,38 +22,40 @@
 # SOFTWARE.
 #
 # ppm.sh - tiny Pi Package Manager prototype for installing/updating single-file Pi resources.
-# Emulates the raw URL / gist install flow proposed in https://github.com/badlogic/pi-mono/issues/4048.
+# Interops with Pi packages while handling single-file URLs and GitHub gists.
 
 set -eu
 
 usage() {
   cat <<'USAGE'
 Usage:
-  ./ppm.sh install --extension --url <url> [options]
-  ./ppm.sh install --skill     --url <url> [options]
-  ./ppm.sh install --theme     --url <url> [options]
-  ./ppm.sh update [options]
+  ./ppm.sh install --extension gist:<gist-url> --name <file> [options]
+  ./ppm.sh install <file-url.ts|js|json|md|markdown> [options]
+  ./ppm.sh install git:<repo> [pi-options]
+  ./ppm.sh update [pi-options]
 
-Aliases:
-  ./ppm.sh gist ...     Same as install; accepts gist.github.com URLs.
+Routing:
+  gist:<url>            Handled by ppm; requires --extension, --skill, or --theme and --name
+  HTTP(S) file URLs     Handled by ppm when the path ends in .ts, .js, .json, .md, or .markdown
+                        Type is inferred from the extension: .ts/.js, .json, .md/.markdown
+  Other sources         Forwarded to pi, e.g. git:, npm:, and package URLs
 
 Options:
   -l, --local           Use project .pi/{extensions,skills,themes} and .pi/settings.json
-      --all             For update, process global and local settings
-  -f, --force           Overwrite an existing installed file/resource
-      --name <name>     Output filename (extension/theme) or skill directory name
+      --name <name>     Output filename for extensions/themes, or skill markdown filename
       --activate        For themes, set the installed theme in settings.json
   -h, --help            Show this help
 
 Examples:
-  ./ppm.sh gist --extension --url https://gist.githubusercontent.com/user/id/raw/foo.ts
-  ./ppm.sh gist --skill --url https://gist.github.com/user/id --name my-skill
-  ./ppm.sh install --theme --url https://raw.githubusercontent.com/user/repo/main/theme.json -l
-  ./ppm.sh update --all
+  ./ppm.sh install --extension gist:https://gist.githubusercontent.com/user/id/raw --name foo.ts
+  ./ppm.sh install --skill gist:https://gist.github.com/user/id --name my-skill.md
+  ./ppm.sh install https://raw.githubusercontent.com/user/repo/main/theme.json -l
+  ./ppm.sh install git:github.com/user/repo
+  ./ppm.sh update
 
 State:
   ppm writes update metadata to the Pi settings file under a top-level "ppm" key.
-  Each entry stores source URL, type, name, and sha256 separately so ppm update
+  Each entry stores source spec, type, name, and sha256 separately so ppm update
   can detect remote changes and restore locally modified files.
 USAGE
 }
@@ -73,6 +75,11 @@ require_command() {
 
 require_node() {
   require_command node
+}
+
+run_pi() {
+  require_command pi
+  pi "$@"
 }
 
 agent_dir() {
@@ -126,11 +133,50 @@ strip_url_noise() {
   printf '%s\n' "$1" | sed 's/[?#].*$//'
 }
 
+source_payload() {
+  case "$1" in
+    gist:*) printf '%s\n' "${1#gist:}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 basename_from_url() {
-  clean=$(strip_url_noise "$1")
+  clean=$(strip_url_noise "$(source_payload "$1")")
   base=${clean##*/}
   [ "$base" = "raw" ] && base=""
   printf '%s\n' "$base"
+}
+
+is_ppm_file_source() {
+  clean=$(strip_url_noise "$(source_payload "$1")")
+  case "$clean" in
+    *.ts|*.js|*.json|*.md|*.markdown) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_ppm_source() {
+  case "$1" in
+    gist:*) return 0 ;;
+    http://*|https://*) is_ppm_file_source "$1" ;;
+    *) return 1 ;;
+  esac
+}
+
+name_has_supported_ext() {
+  case "$1" in
+    *.ts|*.js|*.json|*.md|*.markdown) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resource_type_from_name() {
+  case "$1" in
+    *.ts|*.js) printf '%s\n' extension ;;
+    *.json) printf '%s\n' theme ;;
+    *.md|*.markdown) printf '%s\n' skill ;;
+    *) return 1 ;;
+  esac
 }
 
 sanitize_component() {
@@ -152,22 +198,33 @@ without_ext() {
   esac
 }
 
-normalize_gist_url() {
-  input_url=$1
-  case "$input_url" in
+source_download_url() {
+  input_source=$1
+  case "$input_source" in
     gist:*)
-      normalize_gist_url "${input_url#gist:}"
+      gist_url=${input_source#gist:}
+      case "$gist_url" in
+        https://gist.github.com/*|http://gist.github.com/*)
+          # Convert https://gist.github.com/user/id[/anything] to the gist raw endpoint.
+          rest=$(printf '%s' "$gist_url" | sed -E 's#^https?://gist.github.com/##; s/[?#].*$//')
+          user=$(printf '%s' "$rest" | cut -d/ -f1)
+          id=$(printf '%s' "$rest" | cut -d/ -f2)
+          [ -n "$user" ] && [ -n "$id" ] || fail "invalid gist URL: $gist_url"
+          printf 'https://gist.githubusercontent.com/%s/%s/raw\n' "$user" "$id"
+          ;;
+        https://gist.githubusercontent.com/*|http://gist.githubusercontent.com/*)
+          printf '%s\n' "$gist_url"
+          ;;
+        *)
+          fail "gist: source must point at github gist: $input_source"
+          ;;
+      esac
       ;;
-    https://gist.github.com/*|http://gist.github.com/*)
-      # Convert https://gist.github.com/user/id[/anything] to the gist raw endpoint.
-      rest=$(printf '%s' "$input_url" | sed -E 's#^https?://gist.github.com/##; s/[?#].*$//')
-      user=$(printf '%s' "$rest" | cut -d/ -f1)
-      id=$(printf '%s' "$rest" | cut -d/ -f2)
-      [ -n "$user" ] && [ -n "$id" ] || fail "invalid gist URL: $input_url"
-      printf 'https://gist.githubusercontent.com/%s/%s/raw\n' "$user" "$id"
+    http://*|https://*)
+      printf '%s\n' "$input_source"
       ;;
     *)
-      printf '%s\n' "$input_url"
+      fail "ppm sources must be gist:<url> or a direct HTTP(S) file URL: $input_source"
       ;;
   esac
 }
@@ -317,7 +374,7 @@ install_one() {
   resource_name=$4
   force=$5
 
-  raw_url=$(normalize_gist_url "$source_url")
+  raw_url=$(source_download_url "$source_url")
   tmp=$(make_tmp)
   download "$raw_url" "$tmp" || fail "failed to download: $raw_url"
   hash=$(sha256_file "$tmp")
@@ -372,7 +429,7 @@ update_scope() {
   tab=$(printf '\t')
   while IFS="$tab" read -r source_url resource_type resource_name old_hash; do
     [ -n "$source_url" ] || continue
-    raw_url=$(normalize_gist_url "$source_url")
+    raw_url=$(source_download_url "$source_url")
     tmp=$(make_tmp)
     if ! download "$raw_url" "$tmp"; then
       printf 'Failed to download %s\n' "$source_url" >&2
@@ -409,97 +466,188 @@ update_scope() {
   rm -f "$list_file"
 }
 
+first_install_source() {
+  skip_next=0
+  for arg do
+    if [ "$skip_next" -eq 1 ]; then
+      skip_next=0
+      continue
+    fi
+    case "$arg" in
+      --name) skip_next=1 ;;
+      --name=*|-*) ;;
+      gist:*|http://*|https://*|git:*|npm:*|ssh://*|git://*|/*|./*|../*)
+        printf '%s\n' "$arg"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+ppm_install() {
+  resource_type=""
+  source=""
+  local=0
+  force=0
+  name=""
+  activate=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --extension) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=extension; shift ;;
+      --skill) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=skill; shift ;;
+      --theme) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=theme; shift ;;
+      --name) shift; [ "$#" -gt 0 ] || fail "--name requires a value"; name=$1; shift ;;
+      --name=*) name=${1#--name=}; shift ;;
+      -l|--local) local=1; shift ;;
+      --activate) activate=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      gist:*) [ -z "$source" ] || fail "source given more than once"; source=$1; shift ;;
+      http://*|https://*)
+        is_ppm_file_source "$1" || fail "HTTP(S) sources without .ts, .js, .json, .md, or .markdown are handled by pi"
+        [ -z "$source" ] || fail "source given more than once"
+        source=$1
+        shift
+        ;;
+      -*) fail "unsupported ppm install option: $1" ;;
+      *) fail "unknown ppm install argument: $1" ;;
+    esac
+  done
+
+  [ -n "$source" ] || fail "pass a source: gist:<url> or a direct HTTP(S) file URL"
+
+  base=$(basename_from_url "$source")
+  [ -n "$base" ] || base=$(basename_from_url "$(source_download_url "$source")")
+
+  case "$source" in
+    gist:*)
+      [ -n "$resource_type" ] || fail "gist: installs require one of --extension, --skill, or --theme"
+      [ -n "$name" ] || fail "gist: installs require --name <file> with .ts, .js, .json, .md, or .markdown"
+      name_has_supported_ext "$name" || fail "gist: --name must end in .ts, .js, .json, .md, or .markdown"
+      ext_source=$name
+      ;;
+    *)
+      ext_source=$base
+      if [ -z "$resource_type" ]; then
+        resource_type=$(resource_type_from_name "$ext_source") || fail "could not infer resource type from URL; use .ts, .js, .json, .md, or .markdown"
+      fi
+      ;;
+  esac
+
+  if [ "$activate" -eq 1 ] && [ "$resource_type" != "theme" ]; then
+    fail "--activate only applies to themes"
+  fi
+
+  case "$resource_type" in
+    extension)
+      case "$ext_source" in *.ts|*.js) ;; *) fail "extension sources must use .ts or .js" ;; esac
+      ;;
+    theme)
+      case "$ext_source" in *.json) ;; *) fail "theme sources must use .json" ;; esac
+      ;;
+    skill)
+      case "$ext_source" in *.md|*.markdown) ;; *) fail "skill sources must use .md or .markdown" ;; esac
+      ;;
+  esac
+
+  case "$resource_type" in
+    extension)
+      resource_name=${name:-$base}
+      [ -n "$resource_name" ] || fail "extension installs need a .ts/.js filename; pass --name foo.ts"
+      resource_name=$(sanitize_component "$resource_name")
+      case "$resource_name" in *.ts|*.js) ;; *) fail "extension output name must end in .ts or .js" ;; esac
+      ;;
+    theme)
+      resource_name=${name:-$base}
+      [ -n "$resource_name" ] || fail "theme installs need a .json filename; pass --name theme.json"
+      resource_name=$(sanitize_component "$resource_name")
+      case "$resource_name" in *.json) ;; *) resource_name="$resource_name.json" ;; esac
+      ;;
+    skill)
+      resource_name=${name:-$base}
+      [ -n "$resource_name" ] || resource_name="skill"
+      resource_name=$(sanitize_component "$(without_ext "$resource_name")")
+      ;;
+  esac
+
+  scope=user
+  [ "$local" -eq 1 ] && scope=project
+
+  install_one "$scope" "$resource_type" "$source" "$resource_name" "$force"
+
+  if [ "$activate" -eq 1 ]; then
+    target=$(target_for_resource "$scope" "$resource_type" "$resource_name")
+    theme_name=$(json_get_name "$target")
+    [ -n "$theme_name" ] || theme_name=$(without_ext "$(basename "$target")")
+    activate_theme "$theme_name" "$(settings_for_scope "$scope")"
+  fi
+}
+
+install_dispatch() {
+  for arg do
+    case "$arg" in
+      -h|--help) usage; exit 0 ;;
+    esac
+  done
+
+  install_source=$(first_install_source "$@" || true)
+  case "$install_source" in
+    "") run_pi install "$@" ;;
+    *)
+      if is_ppm_source "$install_source"; then
+        ppm_install "$@"
+      else
+        run_pi install "$@"
+      fi
+      ;;
+  esac
+}
+
+ppm_update_scope_from_args() {
+  scope=user
+  for arg do
+    case "$arg" in
+      -l|--local) scope=project ;;
+      *) return 1 ;;
+    esac
+  done
+  printf '%s\n' "$scope"
+  return 0
+}
+
+update_dispatch() {
+  for arg do
+    case "$arg" in
+      -h|--help) usage; exit 0 ;;
+    esac
+  done
+
+  run_pi update "$@"
+
+  update_scope_name=$(ppm_update_scope_from_args "$@" || true)
+  if [ -n "$update_scope_name" ]; then
+    update_scope "$update_scope_name"
+  fi
+}
+
 cmd=${1:-}
 case "$cmd" in
-  install|gist) shift ;;
+  install)
+    shift
+    install_dispatch "$@"
+    ;;
   update)
     shift
-    update_local=0
-    update_all=0
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        -l|--local) update_local=1; shift ;;
-        --all) update_all=1; shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) fail "unknown update argument: $1" ;;
-      esac
-    done
-    if [ "$update_all" -eq 1 ]; then
-      update_scope user
-      update_scope project
-    elif [ "$update_local" -eq 1 ]; then
-      update_scope project
-    else
-      update_scope user
-    fi
-    exit 0
+    update_dispatch "$@"
     ;;
-  -h|--help|help|"") usage; exit 0 ;;
-  *) fail "unknown command: $cmd (try --help)" ;;
-esac
-
-resource_type=""
-url=""
-local=0
-force=0
-name=""
-activate=0
-
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --extension) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=extension; shift ;;
-    --skill) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=skill; shift ;;
-    --theme) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=theme; shift ;;
-    --url) shift; [ "$#" -gt 0 ] || fail "--url requires a value"; url=$1; shift ;;
-    --url=*) url=${1#--url=}; shift ;;
-    --name) shift; [ "$#" -gt 0 ] || fail "--name requires a value"; name=$1; shift ;;
-    --name=*) name=${1#--name=}; shift ;;
-    -l|--local) local=1; shift ;;
-    -f|--force) force=1; shift ;;
-    --activate|--set-theme) activate=1; shift ;;
-    -h|--help) usage; exit 0 ;;
-    http://*|https://*|gist:*) [ -z "$url" ] || fail "URL given more than once"; url=$1; shift ;;
-    *) fail "unknown argument: $1" ;;
-  esac
-done
-
-[ -n "$resource_type" ] || fail "pass one of --extension, --skill, or --theme"
-[ -n "$url" ] || fail "pass --url <url>"
-if [ "$activate" -eq 1 ] && [ "$resource_type" != "theme" ]; then
-  fail "--activate only applies to themes"
-fi
-
-base=$(basename_from_url "$url")
-[ -n "$base" ] || base=$(basename_from_url "$(normalize_gist_url "$url")")
-
-case "$resource_type" in
-  extension)
-    resource_name=${name:-$base}
-    [ -n "$resource_name" ] || fail "extension installs need a .ts/.js filename; pass --name foo.ts"
-    resource_name=$(sanitize_component "$resource_name")
-    case "$resource_name" in *.ts|*.js) ;; *) fail "extension output name must end in .ts or .js" ;; esac
+  -h|--help|help|"")
+    usage
     ;;
-  theme)
-    resource_name=${name:-$base}
-    [ -n "$resource_name" ] || fail "theme installs need a .json filename; pass --name theme.json"
-    resource_name=$(sanitize_component "$resource_name")
-    case "$resource_name" in *.json) ;; *) resource_name="$resource_name.json" ;; esac
+  gist:*|http://*|https://*|git:*|npm:*|ssh://*|git://*|/*|./*|../*)
+    install_dispatch "$@"
     ;;
-  skill)
-    resource_name=${name:-$base}
-    [ -n "$resource_name" ] || resource_name="skill"
-    resource_name=$(sanitize_component "$(without_ext "$resource_name")")
+  *)
+    run_pi "$@"
     ;;
 esac
-
-scope=user
-[ "$local" -eq 1 ] && scope=project
-
-install_one "$scope" "$resource_type" "$url" "$resource_name" "$force"
-
-if [ "$activate" -eq 1 ]; then
-  target=$(target_for_resource "$scope" "$resource_type" "$resource_name")
-  theme_name=$(json_get_name "$target")
-  [ -n "$theme_name" ] || theme_name=$(without_ext "$(basename "$target")")
-  activate_theme "$theme_name" "$(settings_for_scope "$scope")"
-fi
