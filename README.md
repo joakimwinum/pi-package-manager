@@ -69,6 +69,7 @@ Routing rules:
 - `--theme` installs a theme. Required for gist theme installs.
 - `--name <name>` sets the installed name. Required for gist installs.
 - `-l`, `--local` installs to the current project's `.pi` directory and records metadata in `.pi/settings.json`.
+- `--force` overwrites an existing install target.
 - `--activate` activates an installed theme by writing `theme` in the matching settings file.
 - `-h`, `--help` shows help.
 

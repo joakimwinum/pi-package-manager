@@ -43,6 +43,7 @@ Routing:
 Options:
   -l, --local           Use project .pi/{extensions,skills,themes} and .pi/settings.json
       --name <name>     Output filename for extensions/themes, or skill markdown filename
+      --force           Overwrite an existing install target
       --activate        For themes, set the installed theme in settings.json
   -h, --help            Show this help
 
@@ -501,6 +502,7 @@ ppm_install() {
       --name) shift; [ "$#" -gt 0 ] || fail "--name requires a value"; name=$1; shift ;;
       --name=*) name=${1#--name=}; shift ;;
       -l|--local) local=1; shift ;;
+      --force) force=1; shift ;;
       --activate) activate=1; shift ;;
       -h|--help) usage; exit 0 ;;
       gist:*) [ -z "$source" ] || fail "source given more than once"; source=$1; shift ;;
