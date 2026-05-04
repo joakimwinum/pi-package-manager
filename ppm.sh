@@ -22,36 +22,31 @@
 # SOFTWARE.
 #
 # ppm.sh - tiny Pi Package Manager prototype for installing/updating single-file Pi resources.
-# Interops with Pi packages while handling single-file URLs and GitHub gists.
 
 set -eu
 
 usage() {
   cat <<'USAGE'
+ppm.sh - tiny Pi Package Manager prototype for installing/updating single-file Pi resources.
+
 Usage:
-  ./ppm.sh install --extension gist:<gist-url> --name <file> [options]
   ./ppm.sh install <file-url.ts|js|json|md|markdown> [options]
-  ./ppm.sh install git:<repo> [pi-options]
-  ./ppm.sh update [pi-options]
+  ./ppm.sh update [-l|--local]
 
 Routing:
-  gist:<url>            Handled by ppm; requires --extension, --skill, or --theme and --name
   HTTP(S) file URLs     Handled by ppm when the path ends in .ts, .js, .json, .md, or .markdown
                         Type is inferred from the extension: .ts/.js, .json, .md/.markdown
-  Other sources         Forwarded to pi, e.g. git:, npm:, and package URLs
 
 Options:
   -l, --local           Use project .pi/{extensions,skills,themes} and .pi/settings.json
       --name <name>     Output filename for extensions/themes, or skill markdown filename
-      --force           Overwrite an existing install target
       --activate        For themes, set the installed theme in settings.json
   -h, --help            Show this help
 
 Examples:
-  ./ppm.sh install --extension gist:https://gist.githubusercontent.com/user/id/raw --name foo.ts
-  ./ppm.sh install --skill gist:https://gist.github.com/user/id --name my-skill.md
-  ./ppm.sh install https://raw.githubusercontent.com/user/repo/main/theme.json -l
-  ./ppm.sh install git:github.com/user/repo
+  ./ppm.sh install https://raw.githubusercontent.com/user/repo/main/extension.ts
+  ./ppm.sh install https://raw.githubusercontent.com/user/repo/main/skill.md --name my-skill.md
+  ./ppm.sh install https://raw.githubusercontent.com/user/repo/main/theme.json -l --activate
   ./ppm.sh update
 
 State:
@@ -76,11 +71,6 @@ require_command() {
 
 require_node() {
   require_command node
-}
-
-run_pi() {
-  require_command pi
-  pi "$@"
 }
 
 agent_dir() {
@@ -134,38 +124,16 @@ strip_url_noise() {
   printf '%s\n' "$1" | sed 's/[?#].*$//'
 }
 
-source_payload() {
-  case "$1" in
-    gist:*) printf '%s\n' "${1#gist:}" ;;
-    *) printf '%s\n' "$1" ;;
-  esac
-}
-
 basename_from_url() {
-  clean=$(strip_url_noise "$(source_payload "$1")")
+  clean=$(strip_url_noise "$1")
   base=${clean##*/}
   [ "$base" = "raw" ] && base=""
   printf '%s\n' "$base"
 }
 
 is_ppm_file_source() {
-  clean=$(strip_url_noise "$(source_payload "$1")")
+  clean=$(strip_url_noise "$1")
   case "$clean" in
-    *.ts|*.js|*.json|*.md|*.markdown) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-is_ppm_source() {
-  case "$1" in
-    gist:*) return 0 ;;
-    http://*|https://*) is_ppm_file_source "$1" ;;
-    *) return 1 ;;
-  esac
-}
-
-name_has_supported_ext() {
-  case "$1" in
     *.ts|*.js|*.json|*.md|*.markdown) return 0 ;;
     *) return 1 ;;
   esac
@@ -202,30 +170,11 @@ without_ext() {
 source_download_url() {
   input_source=$1
   case "$input_source" in
-    gist:*)
-      gist_url=${input_source#gist:}
-      case "$gist_url" in
-        https://gist.github.com/*|http://gist.github.com/*)
-          # Convert https://gist.github.com/user/id[/anything] to the gist raw endpoint.
-          rest=$(printf '%s' "$gist_url" | sed -E 's#^https?://gist.github.com/##; s/[?#].*$//')
-          user=$(printf '%s' "$rest" | cut -d/ -f1)
-          id=$(printf '%s' "$rest" | cut -d/ -f2)
-          [ -n "$user" ] && [ -n "$id" ] || fail "invalid gist URL: $gist_url"
-          printf 'https://gist.githubusercontent.com/%s/%s/raw\n' "$user" "$id"
-          ;;
-        https://gist.githubusercontent.com/*|http://gist.githubusercontent.com/*)
-          printf '%s\n' "$gist_url"
-          ;;
-        *)
-          fail "gist: source must point at github gist: $input_source"
-          ;;
-      esac
-      ;;
     http://*|https://*)
       printf '%s\n' "$input_source"
       ;;
     *)
-      fail "ppm sources must be gist:<url> or a direct HTTP(S) file URL: $input_source"
+      fail "ppm sources must be direct HTTP(S) file URLs: $input_source"
       ;;
   esac
 }
@@ -373,8 +322,6 @@ install_one() {
   resource_type=$2
   source_url=$3
   resource_name=$4
-  force=$5
-
   raw_url=$(source_download_url "$source_url")
   tmp=$(make_tmp)
   download "$raw_url" "$tmp" || fail "failed to download: $raw_url"
@@ -385,9 +332,9 @@ install_one() {
   target=$(target_for_resource "$scope" "$resource_type" "$resource_name")
   resource_path=$(resource_path_for_resource "$scope" "$resource_type" "$resource_name")
 
-  if [ -e "$resource_path" ] && [ "$force" -ne 1 ]; then
+  if [ -e "$resource_path" ]; then
     rm -f "$tmp"
-    fail "refusing to overwrite existing $resource_path (use --force)"
+    fail "refusing to overwrite existing $resource_path"
   fi
 
   cat <<EOF
@@ -467,91 +414,40 @@ update_scope() {
   rm -f "$list_file"
 }
 
-first_install_source() {
-  skip_next=0
-  for arg do
-    if [ "$skip_next" -eq 1 ]; then
-      skip_next=0
-      continue
-    fi
-    case "$arg" in
-      --name) skip_next=1 ;;
-      --name=*|-*) ;;
-      gist:*|http://*|https://*|git:*|npm:*|ssh://*|git://*|/*|./*|../*)
-        printf '%s\n' "$arg"
-        return 0
-        ;;
-    esac
-  done
-  return 1
-}
-
 ppm_install() {
-  resource_type=""
   source=""
   local=0
-  force=0
   name=""
   activate=0
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --extension) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=extension; shift ;;
-      --skill) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=skill; shift ;;
-      --theme) [ -z "$resource_type" ] || fail "choose only one resource type"; resource_type=theme; shift ;;
       --name) shift; [ "$#" -gt 0 ] || fail "--name requires a value"; name=$1; shift ;;
       --name=*) name=${1#--name=}; shift ;;
       -l|--local) local=1; shift ;;
-      --force) force=1; shift ;;
       --activate) activate=1; shift ;;
       -h|--help) usage; exit 0 ;;
-      gist:*) [ -z "$source" ] || fail "source given more than once"; source=$1; shift ;;
       http://*|https://*)
-        is_ppm_file_source "$1" || fail "HTTP(S) sources without .ts, .js, .json, .md, or .markdown are handled by pi"
+        is_ppm_file_source "$1" || fail "install source must end in .ts, .js, .json, .md, or .markdown"
         [ -z "$source" ] || fail "source given more than once"
         source=$1
         shift
         ;;
-      -*) fail "unsupported ppm install option: $1" ;;
+      -*) fail "unknown install option: $1" ;;
       *) fail "unknown ppm install argument: $1" ;;
     esac
   done
 
-  [ -n "$source" ] || fail "pass a source: gist:<url> or a direct HTTP(S) file URL"
+  [ -n "$source" ] || fail "pass a direct HTTP(S) file URL"
 
   base=$(basename_from_url "$source")
-  [ -n "$base" ] || base=$(basename_from_url "$(source_download_url "$source")")
+  [ -n "$base" ] || fail "could not derive a filename from URL; pass --name"
 
-  case "$source" in
-    gist:*)
-      [ -n "$resource_type" ] || fail "gist: installs require one of --extension, --skill, or --theme"
-      [ -n "$name" ] || fail "gist: installs require --name <file> with .ts, .js, .json, .md, or .markdown"
-      name_has_supported_ext "$name" || fail "gist: --name must end in .ts, .js, .json, .md, or .markdown"
-      ext_source=$name
-      ;;
-    *)
-      ext_source=$base
-      if [ -z "$resource_type" ]; then
-        resource_type=$(resource_type_from_name "$ext_source") || fail "could not infer resource type from URL; use .ts, .js, .json, .md, or .markdown"
-      fi
-      ;;
-  esac
+  resource_type=$(resource_type_from_name "$base") || fail "could not infer resource type from URL; use .ts, .js, .json, .md, or .markdown"
 
   if [ "$activate" -eq 1 ] && [ "$resource_type" != "theme" ]; then
     fail "--activate only applies to themes"
   fi
-
-  case "$resource_type" in
-    extension)
-      case "$ext_source" in *.ts|*.js) ;; *) fail "extension sources must use .ts or .js" ;; esac
-      ;;
-    theme)
-      case "$ext_source" in *.json) ;; *) fail "theme sources must use .json" ;; esac
-      ;;
-    skill)
-      case "$ext_source" in *.md|*.markdown) ;; *) fail "skill sources must use .md or .markdown" ;; esac
-      ;;
-  esac
 
   case "$resource_type" in
     extension)
@@ -576,7 +472,7 @@ ppm_install() {
   scope=user
   [ "$local" -eq 1 ] && scope=project
 
-  install_one "$scope" "$resource_type" "$source" "$resource_name" "$force"
+  install_one "$scope" "$resource_type" "$source" "$resource_name"
 
   if [ "$activate" -eq 1 ]; then
     target=$(target_for_resource "$scope" "$resource_type" "$resource_name")
@@ -587,23 +483,7 @@ ppm_install() {
 }
 
 install_dispatch() {
-  for arg do
-    case "$arg" in
-      -h|--help) usage; exit 0 ;;
-    esac
-  done
-
-  install_source=$(first_install_source "$@" || true)
-  case "$install_source" in
-    "") run_pi install "$@" ;;
-    *)
-      if is_ppm_source "$install_source"; then
-        ppm_install "$@"
-      else
-        run_pi install "$@"
-      fi
-      ;;
-  esac
+  ppm_install "$@"
 }
 
 ppm_update_scope_from_args() {
@@ -625,12 +505,8 @@ update_dispatch() {
     esac
   done
 
-  run_pi update "$@"
-
-  update_scope_name=$(ppm_update_scope_from_args "$@" || true)
-  if [ -n "$update_scope_name" ]; then
-    update_scope "$update_scope_name"
-  fi
+  update_scope_name=$(ppm_update_scope_from_args "$@") || fail "unknown update option or argument"
+  update_scope "$update_scope_name"
 }
 
 cmd=${1:-}
@@ -646,10 +522,11 @@ case "$cmd" in
   -h|--help|help|"")
     usage
     ;;
-  gist:*|http://*|https://*|git:*|npm:*|ssh://*|git://*|/*|./*|../*)
+  http://*|https://*)
     install_dispatch "$@"
     ;;
   *)
-    run_pi "$@"
+    usage >&2
+    exit 1
     ;;
 esac
