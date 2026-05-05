@@ -1,5 +1,10 @@
 # pi-package-manager
 
+> [!NOTE]
+> This prototype is mostly deprecated. The main gist-based workflow has since been solved by Pi’s native package installer: `pi install GIST_URL`.
+>
+> See [badlogic/pi-mono#4048](https://github.com/badlogic/pi-mono/issues/4048) for details. This repo may still be useful as a reference for direct raw-file URL installs, but it is no longer the recommended path for gist-based Pi extensions, skills, or themes.
+
 `ppm.sh` is a tiny shell-based package manager prototype for [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) resources. It installs and updates single-file Pi extensions, skills, and themes from direct HTTP(S) file URLs.
 
 This prototype follows the direct URL install flow proposed in [badlogic/pi-mono#4048](https://github.com/badlogic/pi-mono/issues/4048). The goal is for this kind of package-management workflow to eventually become native to Pi.
